@@ -3192,11 +3192,22 @@ export class StrategyEngine {
 
       // 检查是否已经存在挂单，避免重复挂单风险
       const existingOrders = this.accountData.openOrders.filter((o: any) => o.symbol === symbol);
-      const hasLimit = existingOrders.some((o: any) => !o.isAlgo);
+      const limitOrders = existingOrders.filter((o: any) => !o.isAlgo);
       const hasAlgo = existingOrders.some((o: any) => o.isAlgo);
+      
+      const currentLimitCount = limitOrders.length;
+      const targetLimitCount = (parseFloat(qty1) > 0 ? 1 : 0) + (parseFloat(qty2) > 0 ? 1 : 0);
 
-      // 挂止盈单 (Limit Sell) - 分两批
-      if (!hasLimit && this.settings.order.tpEnabled !== false) {
+      // 挂止盈单 (Limit Sell) - 支持分两批挂单
+      if (currentLimitCount < targetLimitCount && this.settings.order.tpEnabled !== false) {
+        // 如果已经有部分挂单但数量不对，先清理再重新挂，确保价格和数量准确
+        if (currentLimitCount > 0) {
+          this.addLog('下单', `${symbol} 现有的 Limit 挂单数量(${currentLimitCount})与目标(${targetLimitCount})不符，正在清理并重新挂单...`, 'info');
+          for (const order of limitOrders) {
+            await this.binance.cancelOrder(symbol, order.orderId);
+          }
+        }
+
         // 第一批
         if (parseFloat(qty1) > 0) {
           const tpOrder1 = await this.binance.placeOrder({
@@ -3226,8 +3237,8 @@ export class StrategyEngine {
         }
       } else if (this.settings.order.tpEnabled === false) {
         this.addLog('下单', `${symbol} 已关闭止盈挂单功能`, 'info');
-      } else {
-        this.addLog('下单', `${symbol} 已存在 Limit 挂单，跳过重复挂单`, 'info');
+      } else if (currentLimitCount >= targetLimitCount) {
+        this.addLog('下单', `${symbol} 已存在足够的 Limit 挂单 (${currentLimitCount}/${targetLimitCount})，跳过重复挂单`, 'info');
       }
 
       // 只有在 limit 挂单成功后，再下 algo 委托单
