@@ -1089,7 +1089,9 @@ export class StrategyEngine {
         const isPartial = exitQty && exitOrderId && (Math.abs(openTrade.amount - exitQty) > openTrade.amount * 0.001);
 
         if (isPartial) {
-          // 方案一：分笔记录 - 创建新的 CLOSED 记录，主记录减少数量保持 OPEN
+          this.addLog('订单', `[分笔] 检测到部分成交: ${symbol}, 成交数量: ${exitQty}, 剩余数量: ${(openTrade.amount - exitQty!).toFixed(8)}`, 'info');
+          
+          // 方案一：分笔记录 - 创建新的 CLOSED 记录
           const newLogId = `${openTrade.id}_${exitOrderId}`;
           const partialLog: TradeLog = {
             ...openTrade,
@@ -1101,15 +1103,16 @@ export class StrategyEngine {
             exitOrderId: exitOrderId
           };
           
+          // 先添加新记录
           this.addTradeLog(partialLog);
           
-          // 更新原有 OPEN 记录的剩余数量
+          // 更新原有 OPEN 记录的剩余数量 (内存+数据库)
           this.updateTradeLog(openTrade.id, {
             amount: Number((openTrade.amount - exitQty!).toFixed(8))
           });
           
-          // 异步补全成交详情 (仅针对这一笔平仓单)
-          setTimeout(() => this.fetchAndFillTradeDetails(newLogId, symbol, openTrade.openTime), 2000);
+          // 异步补全成交详情 (此笔记录将包含该 exitOrderId 的盈亏和对应比例的开仓手续费)
+          setTimeout(() => this.fetchAndFillTradeDetails(newLogId, symbol, openTrade.openTime), 3000);
         } else {
           // 常规完全平仓逻辑
           this.updateTradeLog(openTrade.id, {
@@ -1117,12 +1120,10 @@ export class StrategyEngine {
             closeTime: exitTime || Date.now(),
             exitPrice: priceToUse || openTrade.exitPrice,
             exitOrderId: exitOrderId,
-            amount: exitQty || openTrade.amount // 如果是最后一笔，确保数量对齐
+            amount: exitQty || openTrade.amount 
           });
 
-          // 3. 异步补全成交详情
-          // 延迟 2 秒获取，给币安 API 一点同步时间
-          setTimeout(() => this.fetchAndFillTradeDetails(openTrade.id, symbol, openTrade.openTime), 2000);
+          setTimeout(() => this.fetchAndFillTradeDetails(openTrade.id, symbol, openTrade.openTime), 3000);
         }
       } catch (e: any) {
         this.addLog('系统', `确认平仓失败: ${e.message}`, 'error');
@@ -1453,9 +1454,14 @@ export class StrategyEngine {
             .filter(o => o.isAlgo)
             .sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
 
-          if (limitOrders.length > 1) {
-            const redundant = limitOrders.slice(1);
-            this.addLog('清理', `检测到 ${symbol} 有多个 Limit 挂单 (${limitOrders.length})，将清理 ${redundant.length} 个冗余订单，保留最早的一张。`, 'warning');
+          // 修正：根据设置动态决定目标 Limit 订单数
+          const tpQtyRatio1 = this.settings.order.tpQtyRatio1 ?? 50;
+          const tpQtyRatio2 = this.settings.order.tpQtyRatio2 ?? 50;
+          const targetLimitCount = (tpQtyRatio1 > 0 ? 1 : 0) + (tpQtyRatio2 > 0 ? 1 : 0);
+
+          if (limitOrders.length > targetLimitCount) {
+            const redundant = limitOrders.slice(targetLimitCount);
+            this.addLog('清理', `检测到 ${symbol} 有过多的 Limit 挂单 (${limitOrders.length})，目标数量: ${targetLimitCount}，将清理 ${redundant.length} 个冗余订单，保留最早的订单。`, 'warning');
             ordersToCancel.push(...redundant);
           }
 
@@ -2050,81 +2056,66 @@ export class StrategyEngine {
       if (!log) return;
 
       // 优化：从开仓时间开始获取该币种的最大 1000 条成交记录，确保能同时涵盖开仓手续费和平仓明细
-      const startTime = openTime > 2000 ? openTime - 2000 : undefined;
+      const startTime = openTime > 5000 ? openTime - 5000 : undefined;
       const trades = await this.binance.getUserTrades(symbol, 1000, startTime);
-      let relevantTrades = trades.filter((t: any) => t.time >= (openTime - 2000));
+      const allRelevantTrades = trades.filter((t: any) => t.time >= (openTime - 5000));
       
-      // 如果有明确的平仓单ID，只统计该平仓单的成交 (方案一：分笔记录的核心逻辑)
-      if (log.exitOrderId) {
-        relevantTrades = relevantTrades.filter((t: any) => t.orderId.toString() === log.exitOrderId);
+      if (allRelevantTrades.length === 0) {
+        this.addLog('系统', `未发现成交详情: ${symbol}, 将在10秒后重试...`, 'info');
+        setTimeout(() => this.fetchAndFillTradeDetails(logId, symbol, openTime, retryCount + 1), 10000);
+        return;
       }
 
-      if (relevantTrades.length === 0) {
-        // 如果没查到，可能是币安还没同步，10秒后重试
-        this.addLog('系统', `未发现成交详情: ${symbol}, 将在10秒后进行第 ${retryCount + 1} 次重试...`, 'info');
+      // 1. 统计所有的开仓单 (用于计算平均开仓手续费率)
+      const openTrades = allRelevantTrades.filter((t: any) => t.side === log.side);
+      const totalOpenQty = openTrades.reduce((sum, t) => sum + parseFloat(t.qty || '0'), 0);
+      const totalOpenFee = openTrades.reduce((sum, t) => sum + parseFloat(t.commission || '0'), 0);
+      const avgOpenFeePerUnit = totalOpenQty > 0 ? totalOpenFee / totalOpenQty : 0;
+
+      // 2. 统计平仓单 (如果是分笔，只看特定订单)
+      let exitTrades = allRelevantTrades.filter((t: any) => t.side !== log.side);
+      if (log.exitOrderId) {
+        exitTrades = exitTrades.filter((t: any) => t.orderId.toString() === log.exitOrderId);
+      }
+
+      if (exitTrades.length === 0) {
+        this.addLog('系统', `未发现匹配的平仓成交: ${symbol} (ID: ${log.exitOrderId || 'ALL'}), 将在10秒后进行第 ${retryCount + 1} 次重试...`, 'info');
         setTimeout(() => this.fetchAndFillTradeDetails(logId, symbol, openTime, retryCount + 1), 10000);
         return;
       }
 
       let totalPnl = 0;
-      let totalFee = 0;
+      let totalExitFee = 0;
       let exitTime = 0;
-      
       let totalExitQty = 0;
       let totalExitValue = 0;
-      
-      // 确定平仓方向，做多开仓 BUY 对应 SELL 平仓，做空开仓 SELL 对应 BUY 平仓
-      const closeSide = log.side === 'BUY' ? 'SELL' : 'BUY';
 
-      // 确保按照时间升序排列
-      relevantTrades.sort((a: any, b: any) => a.time - b.time);
-
-      let currentPositionSize = 0;
-      let hasOpened = false;
-
-      for (const t of relevantTrades) {
+      for (const t of exitTrades) {
         const qty = parseFloat(t.qty || '0');
-        
-        if (t.side === log.side) {
-          currentPositionSize += qty;
-          hasOpened = true;
-        } else if (t.side === closeSide) {
-          currentPositionSize -= qty;
-        }
-
+        const price = parseFloat(t.price || '0');
         totalPnl += parseFloat(t.realizedPnl || '0');
-        totalFee += parseFloat(t.commission || '0');
-        
-        // 寻找反向单作为平仓单
-        if (t.side === closeSide) {
-          const price = parseFloat(t.price || '0');
-          totalExitQty += qty;
-          totalExitValue += qty * price;
-          exitTime = Math.max(exitTime, t.time);
-        }
-
-        // 以非常微小的阈值判定是否完全平仓，避免浮点数精度问题
-        if (hasOpened && currentPositionSize <= 0.0000001) {
-          break; // 当前周期计算完毕，退出循环（防止混合到下一次的交易记录中）
-        }
+        totalExitFee += parseFloat(t.commission || '0');
+        totalExitQty += qty;
+        totalExitValue += qty * price;
+        exitTime = Math.max(exitTime, t.time);
       }
+
+      // 3. 核心修正：总手续费 = 本次平仓单的手续费 + (本次平仓数量 * 平均开仓手续费)
+      const allocatedOpenFee = totalExitQty * avgOpenFeePerUnit;
+      const finalTotalFee = totalExitFee + allocatedOpenFee;
       
-      // 优化：计算多笔分散平仓成交的加权平均平仓价
-      let exitPrice = 0;
-      if (totalExitQty > 0) {
-        exitPrice = totalExitValue / totalExitQty;
-      }
-
-      const contractValue = log.amount * log.entryPrice;
+      const weightedExitPrice = totalExitQty > 0 ? totalExitValue / totalExitQty : log.exitPrice;
+      const contractValue = totalExitQty * log.entryPrice;
       const profitRate = contractValue > 0 ? (totalPnl / contractValue) * 100 : 0;
 
       this.updateTradeLog(logId, {
-        exitPrice: exitPrice || log.exitPrice,
+        exitPrice: weightedExitPrice,
         pnl: totalPnl,
-        fee: totalFee,
+        fee: finalTotalFee,
         profitRate,
         closeTime: exitTime || Date.now(),
-        status: 'CLOSED'
+        status: 'CLOSED',
+        amount: totalExitQty // 确保数量反映真实成交笔数
       });
       
       this.addLog('系统', `自动补全交易详情成功: ${symbol} (ID: ${logId})`, 'success');
